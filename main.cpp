@@ -1,81 +1,100 @@
 #include <iostream>
 #include <string>
-#include <unordered_map>
 #include <fstream>
-#include <signal.h>
+#include <boost/asio.hpp>
+#include <boost/filesystem.hpp>
 
-#include "HTTPServer.h"
-#include "ResourceHost.h"
+using boost::asio::ip::tcp;
+namespace fs = boost::filesystem;
 
-static HTTPServer* svr;
-void handleSigPipe(int snum) {
-	return;
-}
+class WebServer {
+public:
+    WebServer(short port, const std::string& doc_root) : acceptor_(io_service_, tcp::endpoint(tcp::v4(), port)), doc_root_(doc_root) {
+        startAccept();
+    }
 
-void handleTermSig(int snum) {
-	svr->canRun = false;
-}
+    void run() {
+        io_service_.run();
+    }
 
-int main (int argc, const char * argv[])
-{
-	std::map<std::string, std::string> config;
-	std::fstream cfile;
-	std::string line, key, val;
-	int epos = 0;
-	int drop_uid = 0, drop_gid = 0;
-	cfile.open("server.config");
-	if (!cfile.is_open()) {
-		std::cout << "Unable to open server.config file in working directory" << std::endl;
-		return -1;
-	}
-	while (getline(cfile, line)) {
-		if (line.length() == 0 || line.rfind("#", 0) == 0)
-			continue;
+private:
+    void startAccept() {
+        tcp::socket* newSocket = new tcp::socket(io_service_);
+        acceptor_.async_accept(*newSocket, [this, newSocket](const boost::system::error_code& error) {
+            if (!error) {
+                handleRequest(newSocket);
+            } else {
+                delete newSocket;
+            }
+            startAccept();
+        });
+    }
 
-		epos = line.find("=");
-		key = line.substr(0, epos);
-		val = line.substr(epos + 1, line.length());
-		config.insert(std::pair<std::string, std::string> (key, val));
-	}
-	cfile.close();
-	auto it_vhost = config.find("vhost");
-	auto it_port = config.find("port");
-	auto it_path = config.find("diskpath");
-	if (it_vhost == config.end() || it_port == config.end() || it_path == config.end()) {
-		std::cout << "vhost, port, and diskpath must be supplied in the config, at a minimum" << std::endl;
-		return -1;
-	}std::vector<std::string> vhosts;
-	std::string vhost_alias_str = config["vhost"];
-	std::string delimiter = ",";
-	std::string token;
-	size_t pos = vhost_alias_str.find(delimiter);
-	do {
-		pos = vhost_alias_str.find(delimiter);
-		token = vhost_alias_str.substr(0, pos);
-		vhosts.push_back(token);
-		vhost_alias_str.erase(0, pos + delimiter.length());
-	} while (pos != std::string::npos);
-	if (config.find("drop_uid") != config.end() && config.find("drop_gid") != config.end()) {
-		drop_uid = atoi(config["drop_uid"].c_str());
-		drop_gid = atoi(config["drop_gid"].c_str());
+    void handleRequest(tcp::socket* socket) {
+        boost::asio::streambuf buffer;
+        boost::asio::read_until(*socket, buffer, "\r\n\r\n");
 
-		if (drop_uid <= 0 || drop_gid <= 0) {
-			drop_uid = drop_gid = 0;
-		}
-	}
-	signal(SIGPIPE, handleSigPipe);
-	signal(SIGABRT, &handleTermSig);
-	signal(SIGINT, &handleTermSig);
-	signal(SIGTERM, &handleTermSig);
-	svr = new HTTPServer(vhosts, atoi(config["port"].c_str()), config["diskpath"], drop_uid, drop_gid);
-	if (!svr->start()) {
-		svr->stop();
-		delete svr;
-		return -1;
-	}
-	svr->process();
-	svr->stop();
-	delete svr;
+        std::istream stream(&buffer);
+        std::string request;
+        std::getline(stream, request);
 
-	return 0;
+        // Parse the request
+        std::istringstream request_stream(request);
+        std::string method, path, protocol;
+        request_stream >> method >> path >> protocol;
+
+        // Construct the full path to the requested file
+        std::string full_path = doc_root_ + path;
+
+        // Check if the file exists
+        if (fs::exists(full_path) && fs::is_regular_file(full_path)) {
+            // Read the file contents
+            std::ifstream file(full_path.c_str(), std::ios::binary);
+            std::string file_contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+            // Generate the response headers
+            std::string response_headers = "HTTP/1.1 200 OK\r\n";
+            response_headers += "Content-Type: text/html\r\n";
+            response_headers += "Content-Length: " + std::to_string(file_contents.length()) + "\r\n";
+            response_headers += "Connection: close\r\n\r\n";
+
+            // Send the response headers and file contents
+            boost::asio::write(*socket, boost::asio::buffer(response_headers));
+            boost::asio::write(*socket, boost::asio::buffer(file_contents));
+        } else {
+            // Generate a 404 Not Found response
+            std::string response_headers = "HTTP/1.1 404 Not Found\r\n";
+            response_headers += "Content-Type: text/plain\r\n";
+            response_headers += "Connection: close\r\n\r\n";
+            std::string response_body = "404 Not Found";
+
+            boost::asio::write(*socket, boost::asio::buffer(response_headers));
+            boost::asio::write(*socket, boost::asio::buffer(response_body));
+        }
+
+        delete socket;
+    }
+
+    boost::asio::io_service io_service_;
+    tcp::acceptor acceptor_;
+    std::string doc_root_;
+};
+
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " <port> <doc_root>\n";
+        return 1;
+    }
+
+    short port = std::atoi(argv[1]);
+    std::string doc_root = argv[2];
+
+    try {
+        WebServer server(port, doc_root);
+        server.run();
+    } catch (std::exception& e) {
+        std::cerr << "Exception: " << e.what() << std::endl;
+    }
+
+    return 0;
 }
